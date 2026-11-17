@@ -143,6 +143,9 @@ Read the specific files mentioned in the plan/issue. Understand the current stat
 of code you'll be modifying. Don't read progress history — the issue body provides
 that context.
 
+Read `PROGRESS.md` (where the project stands) and `LESSONS.md` (what has gone wrong
+before) if they exist.
+
 ## Step 4: Verify Assumptions
 
 Check that the plan's assumptions still hold:

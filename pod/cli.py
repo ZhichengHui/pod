@@ -307,6 +307,20 @@ prompt = "/replan"
 lock = "planner"
 copy_build_cache = false
 
+# Summarize agent: updates PROGRESS.md (issues labelled `summarize`, opened by
+# planners after 10+ merged PRs).
+[worker_types.summarize]
+prompt = "/summarize"
+issue_label = "summarize"
+copy_build_cache = false
+
+# Lessons agent: updates LESSONS.md from recent struggles and failed
+# approaches (issues labelled `lessons`, opened by planners after 10+ merged PRs).
+[worker_types.lessons]
+prompt = "/lessons"
+issue_label = "lessons"
+copy_build_cache = false
+
 # Example additional worker type:
 # [worker_types.review]
 # prompt = "/review"
@@ -8928,6 +8942,8 @@ REQUIRED_LABELS = {
     "critical-path": "E11D48",
     "repair-claimed": "7057FF",   # PR is claimed by a repair agent
     "unsalvageable": "5C5C5C",    # PR closed by a repair agent as unsalvageable
+    "summarize": "0E8A16",
+    "lessons": "5319E7",
 }
 
 
