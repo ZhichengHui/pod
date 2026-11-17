@@ -48,6 +48,8 @@ REQUIRED_LABELS = {
     "critical-path": "FF6600",
     "repair-claimed": "7057FF",
     "unsalvageable": "5C5C5C",
+    "summarize": "0E8A16",
+    "lessons": "5319E7",
 }
 
 

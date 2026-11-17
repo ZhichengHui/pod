@@ -20,7 +20,8 @@ project's intended goals. This is the ground truth against which you measure pro
 
 ### Step 2: Read the current progress document
 
-Understand what the project currently claims to have achieved.
+The progress document is `PROGRESS.md` (create it if it does not exist). Understand what the
+project currently claims to have achieved.
 
 ### Step 3: Survey recent work
 
@@ -35,7 +36,7 @@ Understand what the project currently claims to have achieved.
 
 ### Step 5: Produce an updated progress document
 
-Write an updated progress document that:
+Write an updated `PROGRESS.md` that:
 
 - **Accurately reflects** current quality metrics and phase
 - **Describes the architecture structurally** (layers, relationships)

@@ -12,5 +12,5 @@ labels. `work` exists as a manual escape hatch.
 1. Run `coordination list-unclaimed` to see all unclaimed issues (all labels)
 2. Read the issue bodies to understand what's available
 3. Based on your own judgment, select the most important one
-4. Identify its label (`feature`, `review`, `summarize`, or `meditate`)
+4. Identify its label (`feature`, `review`, `summarize`, `lessons`, or `meditate`)
 5. Execute the work following the `agent-worker-flow` skill for that issue type

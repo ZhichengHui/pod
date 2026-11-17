@@ -104,10 +104,14 @@ Your work item MUST NOT overlap with any existing issue's deliverables.
 
 ## Step 5: Write new issues
 
-Work types: **`feature`**, **`review`**, **`summarize`**.
+Work types: **`feature`**, **`review`**, **`summarize`**, **`lessons`**.
 Target roughly 2:1 feature:review during implementation; 1:1 during cleanup.
 
-**Summarize trigger**: when 10+ PRs merged since last summarize issue closed.
+**Summarize trigger**: when 10+ PRs merged since last summarize issue closed. A summarize
+session updates `PROGRESS.md`.
+
+**Lessons trigger**: when 10+ PRs merged since last lessons issue closed. A lessons session
+updates `LESSONS.md` from recent struggles and failed approaches.
 
 Each issue body MUST be **self-contained**:
 - **Current state**, **Deliverables**, **Context**, **Verification**
