@@ -1985,11 +1985,17 @@ def acquire_backend(
         _cur = accounts.current_account()
         shared = (_cur is not None and len(claude_accts) == 1
                   and claude_accts[0].number == _cur)
+        # Agents that are not isolated (no per-agent CLAUDE_CONFIG_DIR) use
+        # the credential of their environment (the host's ~/.claude, or
+        # CLAUDE_CODE_OAUTH_TOKEN). Nothing is leased and no credential is
+        # placed, so any number of them run at once; the quota check still
+        # gates every dispatch.
+        env_auth = claude_config_dir is None
         for cand in candidates:
             if cand.backend == "codex":
                 chosen = cand
                 break
-            if not shared:
+            if not shared and not env_auth:
                 if cand.label in held_by_others:
                     continue
                 if not accounts.try_acquire_lease(
@@ -2002,7 +2008,7 @@ def acquire_backend(
                 if (not fresh
                         or accounts.model_tier("claude", fresh)
                         < accounts.model_tier("claude", cand.model)):
-                    if not shared:
+                    if not shared and not env_auth:
                         accounts.release_lease(cand.label, short_id)
                     continue
             # Place the credential the agent will use. Shared mode symlinks
@@ -2012,7 +2018,9 @@ def acquire_backend(
             # token expired or was cleared — and every session launched on
             # such an account fails auth at startup (~20s, exit 1); the
             # status check below guards against re-dispatching it forever.
-            if shared:
+            if env_auth:
+                status = "ok"
+            elif shared:
                 try:
                     status = accounts.place_shared_credential(
                         claude_config_dir, now=time.time(),
@@ -2044,9 +2052,10 @@ def acquire_backend(
         return None
     if chosen.backend == "claude":
         state.account_label = chosen.label
-        # Shared mode took no lease; lease_acquired_at == 0.0 marks that so
-        # cleanup skips harvest/release (there is nothing to release).
-        state.lease_acquired_at = 0.0 if shared else time.time()
+        # Shared mode and environment credentials take no lease;
+        # lease_acquired_at == 0.0 marks that so cleanup skips harvest/release
+        # (there is nothing to release).
+        state.lease_acquired_at = 0.0 if (shared or env_auth) else time.time()
     else:
         # Picked codex; release any outstanding claude lease.
         if state.account_label:
