@@ -106,6 +106,8 @@ SHARED_ROTATE_LOCK_PATH = POD_DIR / "shared-account-rotate.lock"
 SHARED_ROTATE_STAMP_PATH = POD_DIR / "shared-account-rotate.stamp"
 ISOLATED_CONFIG_DIR = POD_DIR / "claude-config"
 TARGET_FILE = POD_DIR / "target"  # Target agent count (int, one per line)
+# Target saved when return-to-human set it to 0; restored when new work arrives.
+TARGET_BEFORE_RTH_FILE = POD_DIR / "target-before-return-to-human"
 PLANNER_TARGET_FILE = POD_DIR / "planner-target"  # Planner-recommended target agent count
 PLANNER_MIN_QUEUE_FILE = POD_DIR / "planner-min-queue"  # Planner-recommended min_queue
 FORCE_QUOTA_FILE = POD_DIR / "force-quota"  # If exists, skip quota checks globally
@@ -7646,6 +7648,12 @@ def _tui_main(stdscr, config: dict):
     # grandfather status.
     _grandfathered_agents: set[tuple[str, float]] = set()
     if cached_return_to_human:
+        _before = read_target()
+        if _before:
+            try:
+                TARGET_BEFORE_RTH_FILE.write_text(f"{_before}\n")
+            except OSError:
+                pass
         write_target(0)
         _grandfathered_agents = {
             (a.short_id, a.pid_start_time)
@@ -7797,10 +7805,37 @@ def _tui_main(stdscr, config: dict):
         if cached_return_to_human:
             if not _acted_on_return_to_human:
                 _acted_on_return_to_human = True
+                _before = read_target()
+                if _before:
+                    try:
+                        TARGET_BEFORE_RTH_FILE.write_text(f"{_before}\n")
+                    except OSError:
+                        pass
                 write_target(0)
                 message = "Return-to-human: planner found no remaining work. Target set to 0; agents finishing."
                 message_time = now
-            for a in agents:
+            # New work makes the signal stale: an unclaimed issue (the owner's
+            # agent-plan or directive) clears it and restores the target saved
+            # above. This only reads the cached queue depth, so waiting costs
+            # no agent session.
+            if cached_queue:
+                clear_return_to_human(config)
+                cached_return_to_human = False
+                _acted_on_return_to_human = False
+                _grandfathered_agents = set()
+                try:
+                    _restore = int(TARGET_BEFORE_RTH_FILE.read_text().strip())
+                except (OSError, ValueError):
+                    _restore = 1
+                write_target(max(_restore, 1))
+                try:
+                    TARGET_BEFORE_RTH_FILE.unlink()
+                except OSError:
+                    pass
+                log(f"Return-to-human cleared: {cached_queue} unclaimed issue(s); target restored to {max(_restore, 1)}")
+                message = f"New work ({cached_queue} unclaimed issue(s)): return-to-human cleared, target {max(_restore, 1)}."
+                message_time = now
+            for a in (agents if cached_return_to_human else []):
                 if (a.short_id, a.pid_start_time) in _grandfathered_agents:
                     continue
                 # One-shot agents (`pod once`) are explicitly out-of-band:
@@ -9186,6 +9221,7 @@ def cmd_init(args):
         "codex-home/\n"
         "codex-sessions/\n"
         "force-quota\n"
+        "target-before-return-to-human\n"
     )
 
     # Ensure .claude/.pod-checksums is gitignored in the project root
