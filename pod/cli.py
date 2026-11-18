@@ -556,6 +556,16 @@ def _instruction_file_warning(git_root: Path, backend: str) -> str | None:
             "    → Prefer AGENTS.md -> .claude/CLAUDE.md for cross-backend parity.")
 
 
+def _claude_project_dir_name(path: str | Path) -> str:
+    """Name Claude Code gives the transcript directory of a working directory.
+
+    Claude Code replaces every character that is not an ASCII letter or digit
+    with ``-``: ``/a/QF_UF_Smt/.x`` becomes ``-a-QF-UF-Smt--x``. Replacing only
+    ``/`` misses repositories whose path contains ``_`` or ``.``.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
 def _claude_projects_dir(claude_config_dir: Path | None = None) -> Path:
     """Return the directory containing JSONL project subdirs."""
     if claude_config_dir is not None:
@@ -598,7 +608,7 @@ def _bubble_jsonl_dir(bubble_name: str, wt_in_bubble: str) -> Path:
     its JSONL transcript. Bubble mounts ~/.bubble/ai-projects/<name>/
     at /home/user/.claude/projects/.
     """
-    encoded = wt_in_bubble.replace("/", "-")
+    encoded = _claude_project_dir_name(wt_in_bubble)
     return Path.home() / ".bubble" / "ai-projects" / bubble_name / encoded
 
 
@@ -1466,12 +1476,7 @@ def _claude_historical_cost(config: dict,
     """Scan Claude JSONL rollouts for this project and return total $."""
     # Compute the Claude projects-dir prefix for this project.
     # Claude Code munges paths: replace / with -, strip leading dots from components.
-    def _claude_dir_name(p: Path) -> str:
-        parts = str(p).split("/")
-        cleaned = [part.lstrip(".") for part in parts]
-        return "-".join(cleaned)
-
-    project_prefix = _claude_dir_name(PROJECT_DIR)
+    project_prefix = _claude_project_dir_name(PROJECT_DIR)
 
     # Scan both ~/.claude/projects (historical) and isolated config (new sessions)
     projects_dirs = []
@@ -6028,7 +6033,7 @@ def launch_agent(config: dict, session_uuid: str, prompt: str,
         agent_args = codex_args
     else:
         # --- Claude launch (existing behavior) ---
-        jsonl_dir = _claude_projects_dir(claude_config_dir) / wt_dir.replace("/", "-")
+        jsonl_dir = _claude_projects_dir(claude_config_dir) / _claude_project_dir_name(wt_dir)
         local_jsonl = jsonl_dir / f"{session_uuid}.jsonl"
 
         claude_args = ["claude", "--model", model]
@@ -6237,7 +6242,7 @@ def get_jsonl_path(wt_dir: str, session_uuid: str,
         bubble_name = _bubble_name(session_uuid)
         in_repo = _bubble_in_container_repo(wt_dir)
         return str(_bubble_jsonl_dir(bubble_name, in_repo) / f"{session_uuid}.jsonl")
-    jsonl_dir = _claude_projects_dir(claude_config_dir) / wt_dir.replace("/", "-")
+    jsonl_dir = _claude_projects_dir(claude_config_dir) / _claude_project_dir_name(wt_dir)
     return str(jsonl_dir / f"{session_uuid}.jsonl")
 
 
