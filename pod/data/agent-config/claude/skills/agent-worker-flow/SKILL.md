@@ -26,6 +26,7 @@ The `gh` CLI defaults to the current repo, so `--repo` is not needed.
 | `coordination queue-depth [L]` | Count of unclaimed issues; optional label for per-type count |
 | `coordination claim N` | Claim issue #N — adds `claimed` label + comment, detects races |
 | `coordination skip N "reason"` | Mark claimed issue as needing replan — removes `claimed`, adds `replan` label |
+| `coordination needs-owner N "question"` | A human must decide: posts the question on #N, adds `needs-owner` (no worker takes it until the owner removes it), removes `claimed`. Never ask in the conversation instead — nobody reads it |
 | `coordination add-dep N M` | Add `depends-on: #M` to issue #N's body; adds `blocked` label if #M is open |
 | `coordination check-blocked` | Unblock issues whose `depends-on` dependencies are all closed; remove orphan `blocked` from issues whose body has no `depends-on:` lines |
 | `coordination check-has-pr` | Remove orphan `has-pr` from open issues that have no currently-open PR closing them (post audit comment) |
