@@ -50,6 +50,7 @@ REQUIRED_LABELS = {
     "unsalvageable": "5C5C5C",
     "summarize": "0E8A16",
     "lessons": "5319E7",
+    "needs-owner": "D4C5F9",
 }
 
 
@@ -385,8 +386,11 @@ def _check_provenance(issue_num: int | str) -> tuple[bool, str]:
 # Issue list helpers
 # ---------------------------------------------------------------------------
 
-_UNCLAIMED_EXCLUDE = {"claimed", "blocked", "has-pr", "replan"}
-_REPLAN_EXCLUDE = {"claimed", "blocked", "has-pr"}
+# `needs-owner`: an agent asked the owner a question on the issue
+# (`coordination needs-owner`); nobody may take it until the owner answers
+# and removes the label.
+_UNCLAIMED_EXCLUDE = {"claimed", "blocked", "has-pr", "replan", "needs-owner"}
+_REPLAN_EXCLUDE = {"claimed", "blocked", "has-pr", "needs-owner"}
 
 
 def _filtered_issues(items: list[dict], exclude: set[str]) -> list[dict]:
@@ -1492,6 +1496,7 @@ def cmd_claim(ctx: CoordinationContext, argv: list[str]) -> int:
         ("replan",  f"Issue #{issue_num} needs replan."),
         ("blocked", f"Issue #{issue_num} is blocked by dependencies."),
         ("has-pr",  f"Issue #{issue_num} already has an open PR."),
+        ("needs-owner", f"Issue #{issue_num} waits for an owner decision."),
     ]:
         if re.search(rf"\b{label}\b", labels):
             print(f"CLAIM FAILED: {msg} You MUST NOT work on this issue. "
@@ -1567,6 +1572,29 @@ def cmd_skip(ctx: CoordinationContext, argv: list[str]) -> int:
               f"(directive, left claimable): {reason}")
     else:
         print(f"Skipped issue #{issue_num} (marked replan): {reason}")
+    return 0
+
+
+def cmd_needs_owner(ctx: CoordinationContext, argv: list[str]) -> int:
+    """Hand a claimed issue to the owner: nobody reads the agent's
+    conversation, so a question that needs a human goes on the issue.
+    Posts the question, adds `needs-owner` (which keeps every worker off the
+    issue until the owner removes it) and releases the claim."""
+    if len(argv) < 2:
+        die('usage: coordination needs-owner N "question for the owner"')
+    issue_num, question = argv[0], argv[1]
+    client = gh.get_client()
+    body = (f"**Needs an owner decision** (session `{ctx.session_id}`)\n\n"
+            f"{question}\n\n"
+            "Answer here and remove the `needs-owner` label; the issue then "
+            "becomes claimable again.")
+    client.gh_cli("issue", "comment", issue_num, "--repo", ctx.repo,
+                  "--body", body, timeout=30)
+    client.gh_cli("issue", "edit", issue_num, "--repo", ctx.repo,
+                  "--add-label", "needs-owner", timeout=15)
+    client.gh_cli("issue", "edit", issue_num, "--repo", ctx.repo,
+                  "--remove-label", "claimed", timeout=15)
+    print(f"Issue #{issue_num} handed to the owner (needs-owner); claim released")
     return 0
 
 
@@ -2144,6 +2172,7 @@ _COMMANDS = {
     "critical-path-depth": cmd_critical_path_depth,
     "claim": cmd_claim,
     "skip": cmd_skip,
+    "needs-owner": cmd_needs_owner,
     "add-dep": cmd_add_dep,
     "check-blocked": cmd_check_blocked,
     "check-has-pr": cmd_check_has_pr,
@@ -2168,7 +2197,7 @@ _USAGE = (
     "{orient|plan [--label L] [--critical-path]|create-pr|claim-fix|"
     "close-pr|list-pr-repair|list-replan|claim-pr-repair|mark-pr-salvaged|"
     "close-pr-unsalvageable|list-unclaimed [--label L]|queue-depth [L]|"
-    "critical-path-depth|claim|skip|add-dep|check-blocked|check-has-pr|"
+    "critical-path-depth|claim|skip|needs-owner|add-dep|check-blocked|check-has-pr|"
     "release-stale-claims|release-orphan-claims|lock-planner|unlock-planner|lock-status|"
     "force-unlock-planner|return-to-human|check-return-to-human|"
     "clear-return-to-human|nothing-to-plan|set-target|set-min-queue|"

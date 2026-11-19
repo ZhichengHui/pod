@@ -1077,6 +1077,12 @@ class AgentState:
     # is the wall-clock of the first pause in a run; it bounds the total pause.
     resuming_after_pause: bool = False
     quota_paused_at: float = 0.0
+    # Why the next iteration resumes the same session: "quota" (usage limit or
+    # transient API error) or "unfinished" (the session ended still holding its
+    # claim without a PR). `unfinished_resumes` counts the latter for the
+    # current claim, so a session that cannot get further is not resumed forever.
+    resume_reason: str = ""
+    unfinished_resumes: int = 0
 
     def cost(self, config: dict) -> float:
         """Calculate cost in dollars using backend/model-aware pricing."""
@@ -4334,6 +4340,52 @@ def cmd_filter_trusted_issues(config: dict, args) -> None:
         sys.stdout.write("\n")
 
 
+UNFINISHED_RESUME_PROMPT = (
+    "Your previous session ended before issue #{issue} was finished: you still "
+    "hold its claim and opened no pull request. Nobody reads this "
+    "conversation, so a question asked here is never answered. Review your "
+    "conversation history and continue the work where you left off. If you "
+    "stopped because a human must decide something, run "
+    "`coordination needs-owner {issue} \"<the question>\"` and end the "
+    "session; if the issue cannot be done, run `coordination skip {issue} "
+    "\"<reason>\"`.")
+
+
+def _max_unfinished_resumes(config: dict) -> int:
+    return int(cfg_get(config, "monitor", "max_unfinished_resumes", default=1))
+
+
+def _issue_label_names(issue: int) -> set[str] | None:
+    """Labels of an issue, or None if GitHub cannot be asked right now."""
+    try:
+        r = gh.get_client().get(f"/repos/{_get_repo()}/issues/{issue}",
+                                timeout=30)
+        if not r.ok():
+            return None
+        return {l.get("name", "") for l in (r.body() or {}).get("labels") or []}
+    except Exception as e:
+        log(f"_issue_label_names: #{issue}: {e!r}")
+        return None
+
+
+def _should_continue_unfinished(state: "AgentState", config: dict,
+                                labels: set[str] | None, backend: str,
+                                wt_dir: str) -> bool:
+    """Whether a session that ended holding its claim without a PR is resumed
+    as this agent's next session (see the end-of-session handler)."""
+    return (labels is not None
+            and "claimed" in labels
+            and "needs-owner" not in labels
+            and state.claimed_issue > 0
+            and state.pr_number == 0
+            and state.worker_type not in ("repair", "replan")
+            and not state.finishing
+            and backend == "claude"           # only Claude has a real --resume
+            and not _use_bubble(config)
+            and bool(wt_dir) and os.path.isdir(wt_dir)
+            and state.unfinished_resumes < _max_unfinished_resumes(config))
+
+
 def _release_claim(issue_str: str, session_uuid: str, restart_count: int,
                     *, reason: str | None = None) -> bool:
     """Remove the 'claimed' label from an issue and leave an explanatory comment.
@@ -6785,16 +6837,21 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             # `--resume`; no new claim, no new worktree.
             _resume_uuid = state.uuid
             chosen_type = state.worker_type or "work"
-            prompt = ("You were interrupted by a usage limit and have been "
-                      "resumed (possibly on a different account). Review your "
-                      "conversation history and continue exactly where you "
-                      "left off.")
+            if state.resume_reason == "unfinished":
+                prompt = UNFINISHED_RESUME_PROMPT.format(
+                    issue=state.claimed_issue)
+            else:
+                prompt = ("You were interrupted by a usage limit and have been "
+                          "resumed (possibly on a different account). Review "
+                          "your conversation history and continue exactly "
+                          "where you left off.")
             lock_name = ""
             wt_config = {}
             state.status = "dispatching"
             state.write()
-            log(f"Agent {short_id}: resuming after quota pause — session "
-                f"{_resume_uuid} on [{chosen_account_label}]")
+            log(f"Agent {short_id}: resuming session {_resume_uuid} "
+                f"({state.resume_reason or 'quota'}) on "
+                f"[{chosen_account_label}]")
         elif state.target_issue:
             # One-shot mode (set by `pod once`). Skip dispatch, pin the
             # work type the caller chose, and append a directive to the
@@ -6867,6 +6924,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             state.uuid = session_uuid
             state.session_start = time.time()
             state.claimed_issue = 0
+            state.unfinished_resumes = 0
             state.pr_number = 0
             state.tokens_in = 0
             state.tokens_out = 0
@@ -7237,6 +7295,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 # account_label un-pins the resume so it follows swap-account.
                 _release_account_lease(state, claude_config_dir)
                 state.resuming_after_pause = True
+                state.resume_reason = "quota"
                 state.force_quota = False   # one-shot starts True; must wait
                 state.status = "waiting_quota"
                 state.write()
@@ -7311,6 +7370,39 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # edits issues directly without claiming, so calling `coordination
         # skip` on whatever happens to be in `claimed_issue` for those
         # types just churns on closed-issue errors.
+        # --- Continue unfinished work ---
+        # The session ended while still holding its claim and without a PR:
+        # it stopped part-way (it asked a question nobody reads, crashed, ran
+        # out of context, ...). Resume the same conversation in the same
+        # worktree as this agent's next session -- no free agent slot needed,
+        # nothing lost -- before giving the issue up.
+        _issue_labels = None
+        if (state.claimed_issue > 0 and state.pr_number == 0
+                and state.worker_type not in ("repair", "replan")):
+            _issue_labels = _issue_label_names(state.claimed_issue)
+        if _issue_labels is not None and "claimed" not in _issue_labels:
+            # The agent released the issue itself (`coordination skip`,
+            # `coordination needs-owner`, ...): nothing to continue or skip.
+            clear_claim(state.claimed_issue, session_uuid=state.uuid)
+            log(f"Agent {short_id}: #{state.claimed_issue} already released "
+                f"by the session; not skipping")
+            state.claimed_issue = 0
+        elif _should_continue_unfinished(state, config, _issue_labels,
+                                         chosen_backend, wt_dir):
+            state.unfinished_resumes += 1
+            state.resuming_after_pause = True
+            state.resume_reason = "unfinished"
+            log(f"Agent {short_id}: session {state.uuid} ended holding "
+                f"#{state.claimed_issue} without a PR; continuing it "
+                f"(resume {state.unfinished_resumes}/"
+                f"{_max_unfinished_resumes(config)})")
+            # As on every other path back to the loop top: give the account
+            # back; the resume re-acquires the best available one.
+            _release_account_lease(state, claude_config_dir)
+            state.status = "waiting_quota"
+            state.write()
+            continue  # -> top of loop: quota check, then `--resume`
+
         if (state.claimed_issue > 0 and state.pr_number == 0
                 and state.worker_type not in ("repair", "replan")):
             skip_ok = False
@@ -7322,8 +7414,8 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                     cwd=wt_dir,
                 )
                 skip_ok = True
-            except Exception:
-                log(f"Agent {short_id}: coordination skip #{state.claimed_issue} failed")
+            except Exception as e:
+                log(f"Agent {short_id}: coordination skip #{state.claimed_issue} failed: {e!r}")
             if skip_ok:
                 clear_claim(state.claimed_issue, session_uuid=state.uuid)
                 log(f"Agent {short_id}: cleared claim on #{state.claimed_issue} (session ended without PR)")
@@ -8993,6 +9085,7 @@ REQUIRED_LABELS = {
     "unsalvageable": "5C5C5C",    # PR closed by a repair agent as unsalvageable
     "summarize": "0E8A16",
     "lessons": "5319E7",
+    "needs-owner": "D4C5F9",      # an agent asked the owner a question on the issue
 }
 
 

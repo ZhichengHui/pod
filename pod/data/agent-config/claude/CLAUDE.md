@@ -11,6 +11,27 @@ on your PATH — just run it directly (e.g. `coordination orient`,
 
 Session UUID is available as `$POD_SESSION_ID`.
 
+## Nobody Reads This Conversation
+
+No human reads your output while you work or after you end. A question asked
+in the conversation is never answered: ending the session to wait for an
+answer only abandons the issue. Any other instruction you have that says to
+"stop and ask the user" or "tell the user" means, here:
+
+- If you can settle it yourself by the rules you have, do so, carry on with
+  the issue, and mention it in your final report.
+- If a human really must decide, put the question on the issue:
+  `coordination needs-owner N "<the question, with what you found and the
+  options>"`. It posts the question, adds the `needs-owner` label (no worker
+  takes the issue until the owner answers and removes the label) and
+  releases your claim. Push any work worth keeping first, and name the branch
+  in the question. Then end the session.
+- If the issue cannot be done, `coordination skip N "<reason>"`.
+
+Never end a session with a claimed issue and an unanswered question. If a
+session does end holding its claim without a PR, pod resumes it once, and
+then gives the issue up.
+
 ## Agent Types
 
 - **Planners** (`/plan`): create work items as GitHub issues, then exit
