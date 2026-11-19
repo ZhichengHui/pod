@@ -20,7 +20,13 @@ answer only abandons the issue. Any other instruction you have that says to
 
 - If you can settle it yourself by the rules you have, do so, carry on with
   the issue, and mention it in your final report.
-- If a human really must decide, put the question on the issue:
+- Involve the owner as little as possible. Before handing anything over, try
+  to decide it yourself: pick the most reasonable option, note the
+  assumption in your report or PR, and keep working. A different approach,
+  a smaller scope, or `coordination skip` is almost always better than
+  waiting for the owner.
+- Only if a human really must decide (a choice the repository's rules
+  reserve for the owner, or one you cannot undo), put the question on the issue:
   `coordination needs-owner N "<the question, with what you found and the
   options>"`. It posts the question, adds the `needs-owner` label (no worker
   takes the issue until the owner answers and removes the label) and
