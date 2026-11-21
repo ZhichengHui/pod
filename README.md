@@ -78,6 +78,14 @@ For Claude, agent session config (commands, skills) lives in
 `.pod/claude-config/` and is managed by pod -- run `pod update` after
 upgrading pod to get the latest agent prompts.
 
+To run one repository's Claude agents on a particular subscription, set
+`oauth_token_file` in `[agent.claude]` to a file holding a token from
+`claude setup-token` (absolute, `~/…`, or relative to the project).
+Pod exports it as `CLAUDE_CODE_OAUTH_TOKEN` for its claude sessions and
+its quota check, re-reading the setting and the file at every agent
+iteration, so a new token takes effect without restarting pod. Without
+the setting, the environment pod was started with decides.
+
 For Codex, `isolated_config = true` creates a strict pod-managed
 `CODEX_HOME` per worktree. It contains only pod-managed Codex skills, a
 minimal pod-owned `config.toml`, and an `auth.json` symlink for login

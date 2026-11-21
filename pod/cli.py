@@ -162,6 +162,12 @@ accepted_models = ["opus"]
 quota_check = "~/.claude/skills/claude-usage/claude-available-model"
 quota_check_required = true        # Hard-fail if quota unavailable
 quota_retry_seconds = 60           # Sleep duration when quota unavailable
+# File holding a Claude Code OAuth token (`claude setup-token`). When set,
+# pod exports it as CLAUDE_CODE_OAUTH_TOKEN for its claude sessions and its
+# quota check, re-reading the file before every iteration, so this
+# repository runs on that subscription and a new token takes effect without
+# a restart. Unset: the environment pod was started with decides.
+# oauth_token_file = "~/.config/pod/claude_token"
 # When isolated_config = true, each agent gets its own
 # CLAUDE_CONFIG_DIR under .pod/claude-config/<short_id>/ with its own
 # keychain entry, so different agents can simultaneously run on
@@ -1687,6 +1693,34 @@ def _reload_config_value(*keys, default=None):
         return cfg
     except (OSError, KeyError, tomllib.TOMLDecodeError):
         return default
+
+
+def _apply_claude_token_file() -> str:
+    """Export the token in ``[agent.claude] oauth_token_file`` as
+    ``CLAUDE_CODE_OAUTH_TOKEN`` for this process and its children.
+
+    The setting is re-read from config.toml on disk on every call, so a new
+    token or path takes effect at the next iteration. Returns the path used,
+    or "" when the setting is absent. An unreadable or empty file leaves the
+    environment as it was and is logged (never the token itself).
+    """
+    path = _reload_config_value("agent", "claude", "oauth_token_file", default="")
+    if not path:
+        return ""
+    path = os.path.expanduser(str(path))
+    if not os.path.isabs(path):
+        path = str(PROJECT_DIR / path)
+    try:
+        with open(path) as f:
+            token = f.read().strip()
+    except OSError as e:
+        log(f"oauth_token_file {path}: {e.strerror}; keeping the current token")
+        return path
+    if not token:
+        log(f"oauth_token_file {path} is empty; keeping the current token")
+        return path
+    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    return path
 
 
 _MODEL_TIER: dict[str, dict[str, int]] = {
@@ -6627,6 +6661,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     while not state.finishing:
         iteration += 1
         state.loop_iteration = iteration
+        _apply_claude_token_file()
 
         # --- Backend / account selection + quota check ---
         # Resume sessions are pinned to the backend AND Claude account
@@ -9567,6 +9602,7 @@ def main():
         sys.exit(_coord_main(args.coord_args or []))
 
     config = ensure_config()
+    _apply_claude_token_file()
 
     if args.command is None:
         # No subcommand → TUI
