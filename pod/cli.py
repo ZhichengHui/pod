@@ -203,8 +203,14 @@ enabled = false
 # a no-op when ~/.claude/.current-account is absent or the command is missing.
 account_manager_cmd = "~/.claude/swap-account"
 # Max seconds a resuming agent will hold its claim/worktree while waiting for
-# quota to return before giving up and releasing them.
+# quota to return before giving up and releasing them. 0 (or negative) = no
+# cap: the agent waits for the 5-hour or weekly window to reset and resumes.
 max_pause_secs = 5400
+# While a Claude session runs, re-run the quota check every this many seconds;
+# when it reports no quota (e.g. usage past the helper's threshold) the session
+# is interrupted and paused like a usage-limit hit, then `--resume`d in the
+# same worktree once quota returns. 0 disables the in-session check.
+session_check_secs = 300
 
 # Dollars per million tokens.
 # Resolution order when pricing an agent (see `_pricing_for`):
@@ -1782,6 +1788,37 @@ def _backend_available(config: dict, backend: str,
         return _model_tier(backend, available) >= _model_tier(backend, required)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
+
+
+def _over_quota_now(config: dict, backend: str,
+                    claude_config_dir: Path | None = None) -> bool:
+    """True iff ``backend``'s quota helper definitively reports no quota.
+
+    Used by the in-session check, which interrupts a running session, so it
+    errs on the side of letting the session run: only exit status 1 (no
+    quota) counts; an unknown result (exit 2), a timeout or a missing helper
+    does not.
+    """
+    cmd = os.path.expanduser(_backend_cfg(config, "quota_check", backend=backend, default=""))
+    if not cmd:
+        return False
+    args = [cmd]
+    if backend == "claude":
+        resolved = resolve_claude_credential(claude_config_dir)
+        label = resolved.get("accountLabel", "")
+        if label and label != "?":
+            args += ["--account", label]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    return result.returncode == 1
+
+
+def _quota_pause_cap(config: dict) -> float:
+    """``[quota] max_pause_secs`` in seconds; 0 or negative means no cap."""
+    cap = float(cfg_get(config, "quota", "max_pause_secs", default=5400))
+    return cap if cap > 0 else float("inf")
 
 
 def _auto_backend_order(config: dict) -> list[str]:
@@ -4402,6 +4439,43 @@ def _issue_label_names(issue: int) -> set[str] | None:
         return None
 
 
+def _pause_resumable(state: "AgentState", config: dict, backend: str,
+                     wt_dir: str) -> bool:
+    """Whether a session stopped for quota can be paused and later resumed
+    with `--resume` in its preserved worktree (instead of being aborted).
+
+    Only Claude has a real `--resume`, and bubble mode keeps the JSONL where
+    the launcher does not look. The session must own live, unfinished work:
+    a claimed issue and no PR yet (repair/replan sessions own no issue).
+    """
+    return (state.claimed_issue > 0
+            and state.pr_number == 0
+            and state.worker_type not in ("repair", "replan")
+            and backend == "claude"
+            and not _use_bubble(config)
+            and bool(wt_dir) and os.path.isdir(wt_dir))
+
+
+def _interrupt_session(proc: subprocess.Popen, grace: float = 30.0) -> None:
+    """Stop a running agent session so it can be resumed later.
+
+    SIGINT to the whole process group first (Claude Code has already written
+    every finished message to its JSONL), then SIGTERM/SIGKILL if it has not
+    exited within ``grace`` seconds.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGINT)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _kill_stuck_subprocess(proc)
+
+
 def _should_continue_unfinished(state: "AgentState", config: dict,
                                 labels: set[str] | None, backend: str,
                                 wt_dir: str) -> bool:
@@ -6742,8 +6816,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             # this loop would otherwise sleep forever and hold the claim. Give
             # up past the cap and release everything.
             if state.resuming_after_pause and state.quota_paused_at:
-                _cap = float(cfg_get(config, "quota", "max_pause_secs",
-                                     default=5400))
+                _cap = _quota_pause_cap(config)
                 if (time.time() - state.quota_paused_at) > _cap:
                     log(f"Agent {short_id}: quota pause exceeded {_cap:.0f}s "
                         f"while waiting on #{state.claimed_issue}; giving up")
@@ -6876,10 +6949,13 @@ def agent_process_main(config: dict, agent_id: str | None = None,
                 prompt = UNFINISHED_RESUME_PROMPT.format(
                     issue=state.claimed_issue)
             else:
-                prompt = ("You were interrupted by a usage limit and have been "
-                          "resumed (possibly on a different account). Review "
-                          "your conversation history and continue exactly "
-                          "where you left off.")
+                prompt = ("You were paused because the subscription's usage "
+                          "limit was reached (or nearly reached) and have been "
+                          "resumed (possibly on a different account). A command "
+                          "that was still running when you were paused was "
+                          "interrupted: check its state and rerun it if "
+                          "needed. Review your conversation history and "
+                          "continue exactly where you left off.")
             lock_name = ""
             wt_config = {}
             state.status = "dispatching"
@@ -7130,9 +7206,34 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         _stuck_first_detected = 0.0   # monotonic time of first stuck detection
         _stuck_kill_pending = False    # True after phase-1 detection, waiting for confirm
         _last_stuck_check = 0.0       # monotonic time of last health check
+        _last_quota_probe = time.monotonic()  # dispatch just checked quota
+        _threshold_pause = False      # True once the in-session check stopped it
 
         while _agent_proc.poll() is None:
             state.write()
+
+            # --- In-session quota check ---
+            # The dispatch-time check only gates *starting* a session; a long
+            # session would otherwise run on past the threshold up to the hard
+            # usage limit. Re-check periodically and, when there is no quota,
+            # interrupt and pause (resumed below via `--resume`). Only for
+            # sessions that can actually be resumed, and not when the owner
+            # forced quota.
+            _qcheck = float(_reload_config_value(
+                "quota", "session_check_secs", default=300) or 0)
+            if (_qcheck > 0 and not _threshold_pause
+                    and not state.force_quota
+                    and time.monotonic() - _last_quota_probe >= _qcheck
+                    and _pause_resumable(state, config, chosen_backend, wt_dir)):
+                _last_quota_probe = time.monotonic()
+                if _over_quota_now(config, chosen_backend, claude_config_dir):
+                    log(f"Agent {short_id}: quota check reports no quota "
+                        f"during session {state.uuid} on "
+                        f"#{state.claimed_issue}; interrupting to pause it")
+                    _threshold_pause = True
+                    _interrupt_session(_agent_proc)
+                    continue
+
             # Track claim changes: write to history when claimed, clear
             # when PR created. `repair`/`replan` workers do not own a
             # claimed issue (repair tracks via `repair_pr`, replan edits
@@ -7262,7 +7363,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # breaker below.
         stdout_tail = (_read_session_stdout_tail(session_uuid, config)
                        if exit_code != 0 else "")
-        _is_quota_exhausted = any(m in stdout_tail for m in _QUOTA_MARKERS)
+        _is_quota_exhausted = _threshold_pause or _is_quota_text(stdout_tail)
         # Transient server-side API errors (e.g. "529 Overloaded", other 5xx)
         # are not a quota problem — the account is fine, the API just needs a
         # moment. Pause-and-resume the same way (keep claim/worktree/session),
@@ -7289,18 +7390,12 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             # session JSONL outside the path the launcher checks, so a "resume"
             # there would silently start a fresh conversation. Restrict to
             # non-bubble Claude one-shot agents with live, resumable work.
-            _can_resume = (
-                state.target_issue > 0
-                and state.claimed_issue > 0
-                and state.pr_number == 0
-                and state.worker_type not in ("repair", "replan")
-                and chosen_backend == "claude"
-                and not _use_bubble(config)
-                and bool(wt_dir) and os.path.isdir(wt_dir))
+            # Any resumable session (not only `pod once` ones): the work in
+            # the worktree and the conversation are kept and continued.
+            _can_resume = _pause_resumable(state, config, chosen_backend, wt_dir)
             if _can_resume and state.quota_paused_at == 0.0:
                 state.quota_paused_at = time.time()
-            _pause_cap = float(cfg_get(config, "quota", "max_pause_secs",
-                                       default=5400))
+            _pause_cap = _quota_pause_cap(config)
             _paused_for = (time.time() - state.quota_paused_at
                            if state.quota_paused_at else 0.0)
             if _can_resume and _paused_for <= _pause_cap:
@@ -7564,6 +7659,15 @@ def _session_is_broken(exit_code: int, tokens_in: int, tokens_out: int,
 # Substrings in a failed session's stdout tail that mean "quota depleted"
 # (temporary; the account is fine) rather than a broken account.
 _QUOTA_MARKERS = ("hit your limit", "rate limit", "quota exceeded")
+# Claude Code's current wording names the window: "You've hit your 5-hour
+# limit · resets ...", "You've hit your weekly limit", "... Opus limit".
+_QUOTA_RE = re.compile(r"hit your [\w -]{0,30}limit", re.IGNORECASE)
+
+
+def _is_quota_text(text: str) -> bool:
+    """Whether a failed session's stdout tail says the usage limit was hit."""
+    return (any(m in text for m in _QUOTA_MARKERS)
+            or _QUOTA_RE.search(text) is not None)
 
 # Substrings that mean the failure was a transient server-side API error
 # (HTTP 529 "Overloaded" or other 5xx) rather than quota or a code crash.
