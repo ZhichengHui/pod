@@ -203,8 +203,21 @@ enabled = false
 # a no-op when ~/.claude/.current-account is absent or the command is missing.
 account_manager_cmd = "~/.claude/swap-account"
 # Max seconds a resuming agent will hold its claim/worktree while waiting for
-# quota to return before giving up and releasing them.
+# quota to return before giving up and releasing them. 0 (or negative) = no
+# cap: the agent waits for the 5-hour or weekly window to reset and resumes.
 max_pause_secs = 5400
+# While a Claude session runs, re-run the quota check every this many seconds;
+# when it reports no quota (e.g. usage past the helper's threshold) the session
+# is interrupted and paused like a usage-limit hit, then `--resume`d in the
+# same worktree once quota returns. 0 disables the in-session check.
+session_check_secs = 300
+
+[archive]
+# Command that archives this repository's agent records (transcripts, session
+# output, pod.log) somewhere durable. Run in the background, with the project
+# directory as its argument, after every session and on the housekeeping
+# cadence; it must tolerate concurrent calls. "" disables.
+cmd = ""
 
 # Dollars per million tokens.
 # Resolution order when pricing an agent (see `_pricing_for`):
@@ -1782,6 +1795,61 @@ def _backend_available(config: dict, backend: str,
         return _model_tier(backend, available) >= _model_tier(backend, required)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
+
+
+def _over_quota_now(config: dict, backend: str,
+                    claude_config_dir: Path | None = None) -> bool:
+    """True iff ``backend``'s quota helper definitively reports no quota.
+
+    Used by the in-session check, which interrupts a running session, so it
+    errs on the side of letting the session run: only exit status 1 (no
+    quota) counts; an unknown result (exit 2), a timeout or a missing helper
+    does not.
+    """
+    cmd = os.path.expanduser(_backend_cfg(config, "quota_check", backend=backend, default=""))
+    if not cmd:
+        return False
+    args = [cmd]
+    if backend == "claude":
+        resolved = resolve_claude_credential(claude_config_dir)
+        label = resolved.get("accountLabel", "")
+        if label and label != "?":
+            args += ["--account", label]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    return result.returncode == 1
+
+
+_archive_procs: list[subprocess.Popen] = []
+
+
+def _run_archive() -> None:
+    """Start ``[archive] cmd <project dir>`` in the background, if set.
+
+    Output goes to .pod/archive.log. Earlier runs that have exited are
+    reaped here, so no zombies accumulate in a long-lived agent.
+    """
+    _archive_procs[:] = [p for p in _archive_procs if p.poll() is None]
+    cmd = _reload_config_value("archive", "cmd", default="")
+    if not cmd:
+        return
+    cmd = os.path.expanduser(str(cmd))
+    try:
+        with open(PROJECT_DIR / ".pod" / "archive.log", "ab") as out:
+            _archive_procs.append(subprocess.Popen(
+                [cmd, str(PROJECT_DIR)], cwd=str(PROJECT_DIR),
+                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                start_new_session=True))
+    except OSError as e:
+        log(f"archive cmd {cmd}: {e}")
+
+
+def _quota_pause_cap(config: dict) -> float:
+    """``[quota] max_pause_secs`` in seconds; 0 or negative means no cap."""
+    cap = float(cfg_get(config, "quota", "max_pause_secs", default=5400))
+    return cap if cap > 0 else float("inf")
 
 
 def _auto_backend_order(config: dict) -> list[str]:
@@ -4402,6 +4470,43 @@ def _issue_label_names(issue: int) -> set[str] | None:
         return None
 
 
+def _pause_resumable(state: "AgentState", config: dict, backend: str,
+                     wt_dir: str) -> bool:
+    """Whether a session stopped for quota can be paused and later resumed
+    with `--resume` in its preserved worktree (instead of being aborted).
+
+    Only Claude has a real `--resume`, and bubble mode keeps the JSONL where
+    the launcher does not look. The session must own live, unfinished work:
+    a claimed issue and no PR yet (repair/replan sessions own no issue).
+    """
+    return (state.claimed_issue > 0
+            and state.pr_number == 0
+            and state.worker_type not in ("repair", "replan")
+            and backend == "claude"
+            and not _use_bubble(config)
+            and bool(wt_dir) and os.path.isdir(wt_dir))
+
+
+def _interrupt_session(proc: subprocess.Popen, grace: float = 30.0) -> None:
+    """Stop a running agent session so it can be resumed later.
+
+    SIGINT to the whole process group first (Claude Code has already written
+    every finished message to its JSONL), then SIGTERM/SIGKILL if it has not
+    exited within ``grace`` seconds.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGINT)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _kill_stuck_subprocess(proc)
+
+
 def _should_continue_unfinished(state: "AgentState", config: dict,
                                 labels: set[str] | None, backend: str,
                                 wt_dir: str) -> bool:
@@ -6592,10 +6697,46 @@ def _release_paused_session(state: "AgentState", config: dict,
     state.quota_paused_at = 0.0
 
 
+def _load_adopted_state(short_id: str, pid: int) -> "AgentState | None":
+    """The state of a dead agent, taken over by a new process ``pid``.
+
+    Everything the old process held is kept (session uuid, worktree, branch,
+    claim, counters, pause state); only the process fields change. A session
+    that was still running when the old process died, in a worktree that is
+    still there, is marked to be `--resume`d (reason "restart") instead of
+    being replaced by a fresh dispatch, so no work is lost.
+    """
+    try:
+        state = AgentState.from_dict(
+            json.loads((AGENTS_DIR / f"{short_id}.json").read_text()))
+    except (OSError, json.JSONDecodeError, TypeError) as e:
+        log(f"Agent {short_id}: cannot adopt its state file: {e}")
+        return None
+    state.pid = pid
+    state.pid_start_time = _get_pid_start_time(pid)
+    state.finishing = False
+    if (not state.resuming_after_pause and state.uuid
+            and state.claimed_issue > 0 and state.pr_number == 0
+            and state.worker_type not in ("repair", "replan")
+            and state.worktree and os.path.isdir(state.worktree)):
+        state.resuming_after_pause = True
+        state.resume_reason = "restart"
+    state.status = "starting"
+    return state
+
+
+RESTART_RESUME_PROMPT = (
+    "Your session was interrupted because pod was restarted, and has been "
+    "resumed. A command that was still running then was interrupted: check "
+    "its state and rerun it if needed. Review your conversation history and "
+    "continue exactly where you left off.")
+
+
 def agent_process_main(config: dict, agent_id: str | None = None,
                         resume_uuid: str | None = None,
                         target_issue: int = 0,
-                        target_type: str = ""):
+                        target_type: str = "",
+                        adopt: bool = False):
     """Entry point for a forked agent process. Runs the agent loop.
 
     When `target_issue` is set the agent runs in one-shot mode: skip
@@ -6614,18 +6755,26 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     initial_backend = "" if raw_backend == "auto" else raw_backend
     initial_model = "" if raw_backend == "auto" else (
         _backend_cfg(config, "model", default="") or "")
-    state = AgentState(
-        short_id=short_id,
-        pid=my_pid,
-        pid_start_time=_get_pid_start_time(my_pid),
-        status="starting",
-        resume_session_uuid=resume_uuid or "",
-        backend=initial_backend,
-        model=initial_model,
-        target_issue=target_issue,
-        target_type=target_type,
-        force_quota=bool(target_issue),
-    )
+    if adopt:
+        state = _load_adopted_state(short_id, my_pid)
+        if state is None:
+            return
+        log(f"Agent {short_id}: adopted (session {state.uuid}, "
+            f"#{state.claimed_issue}, worktree {state.worktree or '-'}, "
+            f"resume={state.resuming_after_pause}/{state.resume_reason or '-'})")
+    else:
+        state = AgentState(
+            short_id=short_id,
+            pid=my_pid,
+            pid_start_time=_get_pid_start_time(my_pid),
+            status="starting",
+            resume_session_uuid=resume_uuid or "",
+            backend=initial_backend,
+            model=initial_model,
+            target_issue=target_issue,
+            target_type=target_type,
+            force_quota=bool(target_issue),
+        )
     _agent_state = state
     state.write()
 
@@ -6742,8 +6891,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             # this loop would otherwise sleep forever and hold the claim. Give
             # up past the cap and release everything.
             if state.resuming_after_pause and state.quota_paused_at:
-                _cap = float(cfg_get(config, "quota", "max_pause_secs",
-                                     default=5400))
+                _cap = _quota_pause_cap(config)
                 if (time.time() - state.quota_paused_at) > _cap:
                     log(f"Agent {short_id}: quota pause exceeded {_cap:.0f}s "
                         f"while waiting on #{state.claimed_issue}; giving up")
@@ -6788,6 +6936,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # next attempt for a full HOUSEKEEPING_INTERVAL.
         with _housekeeping_filelock() as owns_sweep:
             if owns_sweep and _housekeeping_due(HOUSEKEEPING_INTERVAL):
+                _run_archive()
                 # GitHub-touching steps: skip when GraphQL quota is low. The
                 # quota probe itself uses REST and is cached for 30s, so this
                 # gate is free when quota is healthy. `_gh_quota_ok()` is
@@ -6875,11 +7024,16 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             if state.resume_reason == "unfinished":
                 prompt = UNFINISHED_RESUME_PROMPT.format(
                     issue=state.claimed_issue)
+            elif state.resume_reason == "restart":
+                prompt = RESTART_RESUME_PROMPT
             else:
-                prompt = ("You were interrupted by a usage limit and have been "
-                          "resumed (possibly on a different account). Review "
-                          "your conversation history and continue exactly "
-                          "where you left off.")
+                prompt = ("You were paused because the subscription's usage "
+                          "limit was reached (or nearly reached) and have been "
+                          "resumed (possibly on a different account). A command "
+                          "that was still running when you were paused was "
+                          "interrupted: check its state and rerun it if "
+                          "needed. Review your conversation history and "
+                          "continue exactly where you left off.")
             lock_name = ""
             wt_config = {}
             state.status = "dispatching"
@@ -7130,9 +7284,34 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         _stuck_first_detected = 0.0   # monotonic time of first stuck detection
         _stuck_kill_pending = False    # True after phase-1 detection, waiting for confirm
         _last_stuck_check = 0.0       # monotonic time of last health check
+        _last_quota_probe = time.monotonic()  # dispatch just checked quota
+        _threshold_pause = False      # True once the in-session check stopped it
 
         while _agent_proc.poll() is None:
             state.write()
+
+            # --- In-session quota check ---
+            # The dispatch-time check only gates *starting* a session; a long
+            # session would otherwise run on past the threshold up to the hard
+            # usage limit. Re-check periodically and, when there is no quota,
+            # interrupt and pause (resumed below via `--resume`). Only for
+            # sessions that can actually be resumed, and not when the owner
+            # forced quota.
+            _qcheck = float(_reload_config_value(
+                "quota", "session_check_secs", default=300) or 0)
+            if (_qcheck > 0 and not _threshold_pause
+                    and not state.force_quota
+                    and time.monotonic() - _last_quota_probe >= _qcheck
+                    and _pause_resumable(state, config, chosen_backend, wt_dir)):
+                _last_quota_probe = time.monotonic()
+                if _over_quota_now(config, chosen_backend, claude_config_dir):
+                    log(f"Agent {short_id}: quota check reports no quota "
+                        f"during session {state.uuid} on "
+                        f"#{state.claimed_issue}; interrupting to pause it")
+                    _threshold_pause = True
+                    _interrupt_session(_agent_proc)
+                    continue
+
             # Track claim changes: write to history when claimed, clear
             # when PR created. `repair`/`replan` workers do not own a
             # claimed issue (repair tracks via `repair_pr`, replan edits
@@ -7247,6 +7426,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         log(f"Agent {short_id}: session finished exit={exit_code} "
             f"duration={human_duration(elapsed)} {tok} "
             f"git:{state.git_start}..{git_end}")
+        _run_archive()
 
         # This iteration's resume launch (if any) has now returned; clear the
         # flag so a clean completion exits instead of looping as a resume. A
@@ -7262,7 +7442,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # breaker below.
         stdout_tail = (_read_session_stdout_tail(session_uuid, config)
                        if exit_code != 0 else "")
-        _is_quota_exhausted = any(m in stdout_tail for m in _QUOTA_MARKERS)
+        _is_quota_exhausted = _threshold_pause or _is_quota_text(stdout_tail)
         # Transient server-side API errors (e.g. "529 Overloaded", other 5xx)
         # are not a quota problem — the account is fine, the API just needs a
         # moment. Pause-and-resume the same way (keep claim/worktree/session),
@@ -7289,18 +7469,12 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             # session JSONL outside the path the launcher checks, so a "resume"
             # there would silently start a fresh conversation. Restrict to
             # non-bubble Claude one-shot agents with live, resumable work.
-            _can_resume = (
-                state.target_issue > 0
-                and state.claimed_issue > 0
-                and state.pr_number == 0
-                and state.worker_type not in ("repair", "replan")
-                and chosen_backend == "claude"
-                and not _use_bubble(config)
-                and bool(wt_dir) and os.path.isdir(wt_dir))
+            # Any resumable session (not only `pod once` ones): the work in
+            # the worktree and the conversation are kept and continued.
+            _can_resume = _pause_resumable(state, config, chosen_backend, wt_dir)
             if _can_resume and state.quota_paused_at == 0.0:
                 state.quota_paused_at = time.time()
-            _pause_cap = float(cfg_get(config, "quota", "max_pause_secs",
-                                       default=5400))
+            _pause_cap = _quota_pause_cap(config)
             _paused_for = (time.time() - state.quota_paused_at
                            if state.quota_paused_at else 0.0)
             if _can_resume and _paused_for <= _pause_cap:
@@ -7564,6 +7738,15 @@ def _session_is_broken(exit_code: int, tokens_in: int, tokens_out: int,
 # Substrings in a failed session's stdout tail that mean "quota depleted"
 # (temporary; the account is fine) rather than a broken account.
 _QUOTA_MARKERS = ("hit your limit", "rate limit", "quota exceeded")
+# Claude Code's current wording names the window: "You've hit your 5-hour
+# limit · resets ...", "You've hit your weekly limit", "... Opus limit".
+_QUOTA_RE = re.compile(r"hit your [\w -]{0,30}limit", re.IGNORECASE)
+
+
+def _is_quota_text(text: str) -> bool:
+    """Whether a failed session's stdout tail says the usage limit was hit."""
+    return (any(m in text for m in _QUOTA_MARKERS)
+            or _QUOTA_RE.search(text) is not None)
 
 # Substrings that mean the failure was a transient server-side API error
 # (HTTP 529 "Overloaded" or other 5xx) rather than quota or a code crash.
@@ -7637,7 +7820,8 @@ def _git_rev(wt_dir: str) -> str:
 def spawn_agent(config: dict, agent_id: str | None = None,
                 resume_uuid: str | None = None,
                 target_issue: int = 0,
-                target_type: str = "") -> int:
+                target_type: str = "",
+                adopt: bool = False) -> int:
     """Fork a new agent process. Returns PID of the intermediate child.
 
     Uses double-fork so the agent is orphaned (adopted by init) and never
@@ -7682,7 +7866,8 @@ def spawn_agent(config: dict, agent_id: str | None = None,
         os.close(devnull_w)
         agent_process_main(config, agent_id, resume_uuid,
                             target_issue=target_issue,
-                            target_type=target_type)
+                            target_type=target_type,
+                            adopt=adopt)
     except Exception as e:
         # Log the full traceback so the operator can diagnose post-hoc.
         # The agent's stdout went to /dev/null after the dup2 above, so
@@ -8693,6 +8878,32 @@ def cmd_add(config: dict, args):
     print(f"Launched {n} agent{'s' if n != 1 else ''}. Target: {new_target}.")
 
 
+def cmd_adopt(config: dict, args):
+    """Restart a dead agent from its state file, keeping its work.
+
+    The new process takes over the old one's session, worktree, branch and
+    claim (see `_load_adopted_state`): a paused session is resumed when quota
+    allows, a session that was running is `--resume`d. Use it to move agents
+    onto a newly installed pod: stop the old process with SIGKILL (not `pod
+    kill`/`pod finish`, which release the claim and delete the worktree of a
+    paused session), then `pod adopt <id>`.
+    """
+    path = AGENTS_DIR / f"{args.agent_id}.json"
+    try:
+        old = AgentState.from_dict(json.loads(path.read_text()))
+    except (OSError, json.JSONDecodeError, TypeError) as e:
+        print(f"No usable state file for agent {args.agent_id}: {e}")
+        sys.exit(1)
+    if old.pid > 0 and _pid_is_valid(old.pid, old.pid_start_time):
+        print(f"Agent {old.short_id} is still running (PID {old.pid}). Stop it "
+              f"with `kill -KILL {old.pid}` first; `pod kill`/`pod finish` "
+              f"would release its work.")
+        sys.exit(1)
+    pid = spawn_agent(config, agent_id=old.short_id, adopt=True)
+    print(f"Adopted agent {old.short_id} (PID {pid}): session {old.uuid}, "
+          f"#{old.claimed_issue}, worktree {old.worktree or '-'}")
+
+
 def cmd_once(config: dict, args):
     """Launch a one-shot agent targeting a specific issue.
 
@@ -9497,6 +9708,12 @@ def main():
     p_kill = sub.add_parser("kill", help="Kill agent immediately")
     p_kill.add_argument("target", help="Agent ID prefix or 'all'")
 
+    p_adopt = sub.add_parser(
+        "adopt",
+        help="Restart a dead agent from its state file, keeping its session, "
+             "worktree and claim (e.g. after installing a new pod)")
+    p_adopt.add_argument("agent_id", help="Full agent ID (the state file name)")
+
     p_once = sub.add_parser(
         "once",
         help="Launch a one-shot agent against a specific issue, "
@@ -9621,6 +9838,8 @@ def main():
         cmd_finish(config, args)
     elif args.command == "kill":
         cmd_kill(config, args)
+    elif args.command == "adopt":
+        cmd_adopt(config, args)
     elif args.command == "once":
         cmd_once(config, args)
     elif args.command == "status":
