@@ -160,5 +160,69 @@ class RunArchiveTests(unittest.TestCase):
         self.assertEqual(cli._archive_procs, [])
 
 
+class AdoptTests(unittest.TestCase):
+    def setUp(self):
+        self.agents = tempfile.mkdtemp()
+        self.wt = tempfile.mkdtemp()
+        self.p = mock.patch.object(cli, "AGENTS_DIR", cli.Path(self.agents))
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def _write(self, **kw):
+        fields = dict(uuid="sess-9", worktree=self.wt, branch="agent/sess-9",
+                      pid=999999, status="waiting_quota", backend="claude")
+        fields.update(kw)
+        s = _state(**fields)
+        s.write()
+        return s
+
+    def test_paused_agent_keeps_everything(self):
+        self._write(resuming_after_pause=True, resume_reason="unfinished",
+                    unfinished_resumes=1)
+        s = cli._load_adopted_state("abcd1234", os.getpid())
+        self.assertEqual((s.uuid, s.worktree, s.branch, s.claimed_issue),
+                         ("sess-9", self.wt, "agent/sess-9", 60))
+        self.assertEqual((s.resuming_after_pause, s.resume_reason, s.unfinished_resumes),
+                         (True, "unfinished", 1))
+        self.assertEqual(s.pid, os.getpid())
+        self.assertFalse(s.finishing)
+
+    def test_running_session_is_resumed_not_replaced(self):
+        self._write(resuming_after_pause=False, status="running")
+        s = cli._load_adopted_state("abcd1234", os.getpid())
+        self.assertTrue(s.resuming_after_pause)
+        self.assertEqual(s.resume_reason, "restart")
+
+    def test_nothing_to_resume_without_worktree_or_claim(self):
+        self._write(resuming_after_pause=False, claimed_issue=0)
+        self.assertFalse(cli._load_adopted_state("abcd1234", os.getpid())
+                         .resuming_after_pause)
+
+    def test_missing_state_file(self):
+        with mock.patch.object(cli, "log"):
+            self.assertIsNone(cli._load_adopted_state("nope", os.getpid()))
+
+    def test_adopt_refuses_a_live_agent(self):
+        s = self._write(resuming_after_pause=True)
+        s.pid = os.getpid()
+        s.pid_start_time = cli._get_pid_start_time(os.getpid())
+        s.write()
+        args = mock.Mock(agent_id="abcd1234")
+        with mock.patch.object(cli, "spawn_agent") as spawn, \
+             self.assertRaises(SystemExit):
+            cli.cmd_adopt({}, args)
+        spawn.assert_not_called()
+
+    def test_adopt_spawns_for_a_dead_agent(self):
+        self._write(resuming_after_pause=True)
+        args = mock.Mock(agent_id="abcd1234")
+        with mock.patch.object(cli, "spawn_agent", return_value=1) as spawn, \
+             mock.patch.object(cli, "_pid_is_valid", return_value=False):
+            cli.cmd_adopt({}, args)
+        spawn.assert_called_once_with({}, agent_id="abcd1234", adopt=True)
+
+
 if __name__ == "__main__":
     unittest.main()

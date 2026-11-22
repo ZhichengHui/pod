@@ -6697,10 +6697,46 @@ def _release_paused_session(state: "AgentState", config: dict,
     state.quota_paused_at = 0.0
 
 
+def _load_adopted_state(short_id: str, pid: int) -> "AgentState | None":
+    """The state of a dead agent, taken over by a new process ``pid``.
+
+    Everything the old process held is kept (session uuid, worktree, branch,
+    claim, counters, pause state); only the process fields change. A session
+    that was still running when the old process died, in a worktree that is
+    still there, is marked to be `--resume`d (reason "restart") instead of
+    being replaced by a fresh dispatch, so no work is lost.
+    """
+    try:
+        state = AgentState.from_dict(
+            json.loads((AGENTS_DIR / f"{short_id}.json").read_text()))
+    except (OSError, json.JSONDecodeError, TypeError) as e:
+        log(f"Agent {short_id}: cannot adopt its state file: {e}")
+        return None
+    state.pid = pid
+    state.pid_start_time = _get_pid_start_time(pid)
+    state.finishing = False
+    if (not state.resuming_after_pause and state.uuid
+            and state.claimed_issue > 0 and state.pr_number == 0
+            and state.worker_type not in ("repair", "replan")
+            and state.worktree and os.path.isdir(state.worktree)):
+        state.resuming_after_pause = True
+        state.resume_reason = "restart"
+    state.status = "starting"
+    return state
+
+
+RESTART_RESUME_PROMPT = (
+    "Your session was interrupted because pod was restarted, and has been "
+    "resumed. A command that was still running then was interrupted: check "
+    "its state and rerun it if needed. Review your conversation history and "
+    "continue exactly where you left off.")
+
+
 def agent_process_main(config: dict, agent_id: str | None = None,
                         resume_uuid: str | None = None,
                         target_issue: int = 0,
-                        target_type: str = ""):
+                        target_type: str = "",
+                        adopt: bool = False):
     """Entry point for a forked agent process. Runs the agent loop.
 
     When `target_issue` is set the agent runs in one-shot mode: skip
@@ -6719,18 +6755,26 @@ def agent_process_main(config: dict, agent_id: str | None = None,
     initial_backend = "" if raw_backend == "auto" else raw_backend
     initial_model = "" if raw_backend == "auto" else (
         _backend_cfg(config, "model", default="") or "")
-    state = AgentState(
-        short_id=short_id,
-        pid=my_pid,
-        pid_start_time=_get_pid_start_time(my_pid),
-        status="starting",
-        resume_session_uuid=resume_uuid or "",
-        backend=initial_backend,
-        model=initial_model,
-        target_issue=target_issue,
-        target_type=target_type,
-        force_quota=bool(target_issue),
-    )
+    if adopt:
+        state = _load_adopted_state(short_id, my_pid)
+        if state is None:
+            return
+        log(f"Agent {short_id}: adopted (session {state.uuid}, "
+            f"#{state.claimed_issue}, worktree {state.worktree or '-'}, "
+            f"resume={state.resuming_after_pause}/{state.resume_reason or '-'})")
+    else:
+        state = AgentState(
+            short_id=short_id,
+            pid=my_pid,
+            pid_start_time=_get_pid_start_time(my_pid),
+            status="starting",
+            resume_session_uuid=resume_uuid or "",
+            backend=initial_backend,
+            model=initial_model,
+            target_issue=target_issue,
+            target_type=target_type,
+            force_quota=bool(target_issue),
+        )
     _agent_state = state
     state.write()
 
@@ -6980,6 +7024,8 @@ def agent_process_main(config: dict, agent_id: str | None = None,
             if state.resume_reason == "unfinished":
                 prompt = UNFINISHED_RESUME_PROMPT.format(
                     issue=state.claimed_issue)
+            elif state.resume_reason == "restart":
+                prompt = RESTART_RESUME_PROMPT
             else:
                 prompt = ("You were paused because the subscription's usage "
                           "limit was reached (or nearly reached) and have been "
@@ -7774,7 +7820,8 @@ def _git_rev(wt_dir: str) -> str:
 def spawn_agent(config: dict, agent_id: str | None = None,
                 resume_uuid: str | None = None,
                 target_issue: int = 0,
-                target_type: str = "") -> int:
+                target_type: str = "",
+                adopt: bool = False) -> int:
     """Fork a new agent process. Returns PID of the intermediate child.
 
     Uses double-fork so the agent is orphaned (adopted by init) and never
@@ -7819,7 +7866,8 @@ def spawn_agent(config: dict, agent_id: str | None = None,
         os.close(devnull_w)
         agent_process_main(config, agent_id, resume_uuid,
                             target_issue=target_issue,
-                            target_type=target_type)
+                            target_type=target_type,
+                            adopt=adopt)
     except Exception as e:
         # Log the full traceback so the operator can diagnose post-hoc.
         # The agent's stdout went to /dev/null after the dup2 above, so
@@ -8830,6 +8878,32 @@ def cmd_add(config: dict, args):
     print(f"Launched {n} agent{'s' if n != 1 else ''}. Target: {new_target}.")
 
 
+def cmd_adopt(config: dict, args):
+    """Restart a dead agent from its state file, keeping its work.
+
+    The new process takes over the old one's session, worktree, branch and
+    claim (see `_load_adopted_state`): a paused session is resumed when quota
+    allows, a session that was running is `--resume`d. Use it to move agents
+    onto a newly installed pod: stop the old process with SIGKILL (not `pod
+    kill`/`pod finish`, which release the claim and delete the worktree of a
+    paused session), then `pod adopt <id>`.
+    """
+    path = AGENTS_DIR / f"{args.agent_id}.json"
+    try:
+        old = AgentState.from_dict(json.loads(path.read_text()))
+    except (OSError, json.JSONDecodeError, TypeError) as e:
+        print(f"No usable state file for agent {args.agent_id}: {e}")
+        sys.exit(1)
+    if old.pid > 0 and _pid_is_valid(old.pid, old.pid_start_time):
+        print(f"Agent {old.short_id} is still running (PID {old.pid}). Stop it "
+              f"with `kill -KILL {old.pid}` first; `pod kill`/`pod finish` "
+              f"would release its work.")
+        sys.exit(1)
+    pid = spawn_agent(config, agent_id=old.short_id, adopt=True)
+    print(f"Adopted agent {old.short_id} (PID {pid}): session {old.uuid}, "
+          f"#{old.claimed_issue}, worktree {old.worktree or '-'}")
+
+
 def cmd_once(config: dict, args):
     """Launch a one-shot agent targeting a specific issue.
 
@@ -9634,6 +9708,12 @@ def main():
     p_kill = sub.add_parser("kill", help="Kill agent immediately")
     p_kill.add_argument("target", help="Agent ID prefix or 'all'")
 
+    p_adopt = sub.add_parser(
+        "adopt",
+        help="Restart a dead agent from its state file, keeping its session, "
+             "worktree and claim (e.g. after installing a new pod)")
+    p_adopt.add_argument("agent_id", help="Full agent ID (the state file name)")
+
     p_once = sub.add_parser(
         "once",
         help="Launch a one-shot agent against a specific issue, "
@@ -9758,6 +9838,8 @@ def main():
         cmd_finish(config, args)
     elif args.command == "kill":
         cmd_kill(config, args)
+    elif args.command == "adopt":
+        cmd_adopt(config, args)
     elif args.command == "once":
         cmd_once(config, args)
     elif args.command == "status":
