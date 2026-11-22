@@ -212,6 +212,13 @@ max_pause_secs = 5400
 # same worktree once quota returns. 0 disables the in-session check.
 session_check_secs = 300
 
+[archive]
+# Command that archives this repository's agent records (transcripts, session
+# output, pod.log) somewhere durable. Run in the background, with the project
+# directory as its argument, after every session and on the housekeeping
+# cadence; it must tolerate concurrent calls. "" disables.
+cmd = ""
+
 # Dollars per million tokens.
 # Resolution order when pricing an agent (see `_pricing_for`):
 #   [pricing.<backend>.<model>]
@@ -1813,6 +1820,30 @@ def _over_quota_now(config: dict, backend: str,
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
     return result.returncode == 1
+
+
+_archive_procs: list[subprocess.Popen] = []
+
+
+def _run_archive() -> None:
+    """Start ``[archive] cmd <project dir>`` in the background, if set.
+
+    Output goes to .pod/archive.log. Earlier runs that have exited are
+    reaped here, so no zombies accumulate in a long-lived agent.
+    """
+    _archive_procs[:] = [p for p in _archive_procs if p.poll() is None]
+    cmd = _reload_config_value("archive", "cmd", default="")
+    if not cmd:
+        return
+    cmd = os.path.expanduser(str(cmd))
+    try:
+        with open(PROJECT_DIR / ".pod" / "archive.log", "ab") as out:
+            _archive_procs.append(subprocess.Popen(
+                [cmd, str(PROJECT_DIR)], cwd=str(PROJECT_DIR),
+                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                start_new_session=True))
+    except OSError as e:
+        log(f"archive cmd {cmd}: {e}")
 
 
 def _quota_pause_cap(config: dict) -> float:
@@ -6861,6 +6892,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         # next attempt for a full HOUSEKEEPING_INTERVAL.
         with _housekeeping_filelock() as owns_sweep:
             if owns_sweep and _housekeeping_due(HOUSEKEEPING_INTERVAL):
+                _run_archive()
                 # GitHub-touching steps: skip when GraphQL quota is low. The
                 # quota probe itself uses REST and is cached for 30s, so this
                 # gate is free when quota is healthy. `_gh_quota_ok()` is
@@ -7348,6 +7380,7 @@ def agent_process_main(config: dict, agent_id: str | None = None,
         log(f"Agent {short_id}: session finished exit={exit_code} "
             f"duration={human_duration(elapsed)} {tok} "
             f"git:{state.git_start}..{git_end}")
+        _run_archive()
 
         # This iteration's resume launch (if any) has now returned; clear the
         # flag so a clean completion exits instead of looping as a resume. A

@@ -124,5 +124,41 @@ class InterruptSessionTests(unittest.TestCase):
         cli._interrupt_session(proc, grace=1)   # must not raise
 
 
+class RunArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.proj = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.proj, ".pod"))
+        self.p = [mock.patch.object(cli, "PROJECT_DIR", cli.Path(self.proj))]
+        for p in self.p:
+            p.start()
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+        cli._archive_procs.clear()
+
+    def test_runs_cmd_with_project_dir_and_reaps(self):
+        out = os.path.join(self.proj, "arg")
+        script = os.path.join(self.proj, "arch")
+        with open(script, "w") as f:
+            f.write(f'#!/bin/sh\necho "$1" > {out}\n')
+        os.chmod(script, 0o755)
+        with mock.patch.object(cli, "_reload_config_value", return_value=script):
+            cli._run_archive()
+            cli._archive_procs[0].wait(timeout=10)
+            self.assertEqual(open(out).read().strip(), self.proj)
+            cli._run_archive()          # reaps the finished run
+            self.assertEqual(len(cli._archive_procs), 1)
+
+    def test_unset_or_missing_cmd_is_harmless(self):
+        with mock.patch.object(cli, "_reload_config_value", return_value=""):
+            cli._run_archive()
+        with mock.patch.object(cli, "_reload_config_value",
+                               return_value="/nonexistent/archive"), \
+             mock.patch.object(cli, "log"):
+            cli._run_archive()
+        self.assertEqual(cli._archive_procs, [])
+
+
 if __name__ == "__main__":
     unittest.main()
