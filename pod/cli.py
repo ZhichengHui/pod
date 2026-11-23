@@ -2763,9 +2763,10 @@ def _parse_codex_jsonl_line(line: bytes, state: AgentState):
             m2 = re.search(r"(?:coordination\s+create-pr\s+(?:--\S+\s+)*)(\d+)", cmd)
             if m2:
                 state.pr_number = int(m2.group(1))
-            # Detect repair-claim release (mark-pr-salvaged / close-pr-unsalvageable)
+            # Detect repair-claim release (mark-pr-salvaged / close-pr-unsalvageable /
+            # pr-needs-owner)
             m_rel = re.search(
-                r"coordination\s+(?:mark-pr-salvaged|close-pr-unsalvageable)\s+(\d+)",
+                r"coordination\s+(?:mark-pr-salvaged|close-pr-unsalvageable|pr-needs-owner)\s+(\d+)",
                 cmd,
             )
             if m_rel:
@@ -2832,11 +2833,12 @@ def _tool_detail(name: str, inp: dict, state: AgentState) -> str:
         m = re.search(r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+create-pr\s+(?:--\S+\s+)*(\d+)", cmd)
         if m:
             state.pr_number = int(m.group(1))
-        # Repair-claim release: mark-pr-salvaged / close-pr-unsalvageable
+        # Repair-claim release: mark-pr-salvaged / close-pr-unsalvageable /
+        # pr-needs-owner
         # clear the repair-claimed label, so we should clear our own tracking
         # as soon as we see the command fire.
         m_rel = re.search(
-            r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+(?:mark-pr-salvaged|close-pr-unsalvageable)\s+(\d+)",
+            r"(?:^|&&\s*|;\s*)(?:\./)?coordination\s+(?:mark-pr-salvaged|close-pr-unsalvageable|pr-needs-owner)\s+(\d+)",
             cmd,
         )
         if m_rel:

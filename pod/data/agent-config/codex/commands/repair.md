@@ -34,7 +34,16 @@ failing, abandon: `coordination close-pr-unsalvageable <pr-number> "<reason>"`.
 That closes the PR and marks the linked issue `replan`, so the planner will
 produce a fresh approach.
 
+## Only the Owner Can Unblock It
+
+If nothing you are allowed to change can fix the PR (for example the only
+failing check needs a file agents may not edit), run
+`coordination pr-needs-owner <pr-number> "<what the owner must do, and why>"`.
+It adds `needs-owner`, so repair sessions skip the PR until the owner acts.
+Never end by only releasing the claim: the next dispatch would pick the same
+PR again.
+
 ## The Fix-or-Abandon Rule
 
-Exactly two terminal states: *salvaged* or *abandoned*. No human tickets.
+Exactly three terminal states: *salvaged*, *abandoned* or *needs owner*. No human tickets.
 Complex conflicts become re-implementations via `replan`, not escalations.
