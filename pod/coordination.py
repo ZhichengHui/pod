@@ -1002,6 +1002,9 @@ def _rollup_pending(checks: list[dict]) -> bool:
     return False
 
 
+_PR_REPAIR_EXCLUDE = {"repair-claimed", "needs-owner"}
+
+
 def cmd_list_pr_repair(ctx: CoordinationContext, argv: list[str]) -> int:
     client = gh.get_client()
     stuck_seconds = ctx.stuck_ci_minutes * 60
@@ -1017,7 +1020,11 @@ def cmd_list_pr_repair(ctx: CoordinationContext, argv: list[str]) -> int:
     prs = _safe_json(r.stdout, default=[]) or []
 
     def claimed(pr):
-        return any(l.get("name") == "repair-claimed"
+        # `repair-claimed`: another repair session holds it.
+        # `needs-owner`: the PR waits for an owner decision (for example a
+        # change agents may not make); a repair session cannot help, so
+        # listing it would dispatch repair sessions on it in a loop.
+        return any(l.get("name") in _PR_REPAIR_EXCLUDE
                    for l in (pr.get("labels") or []))
 
     # Conflicts
@@ -1191,6 +1198,10 @@ def cmd_claim_pr_repair(ctx: CoordinationContext, argv: list[str]) -> int:
     if re.search(r"\brepair-claimed\b", labels):
         print(f"CLAIM FAILED: PR #{pr_num} is already repair-claimed.")
         return 1
+    if re.search(r"\bneeds-owner\b", labels):
+        print(f"CLAIM FAILED: PR #{pr_num} waits for an owner decision "
+              "(needs-owner).")
+        return 1
 
     # Freeze the race-detect cutoff BEFORE posting so the layer's
     # rate-limit back-pressure (which can sleep up to 60s) can't push
@@ -1261,6 +1272,36 @@ def cmd_mark_pr_salvaged(ctx: CoordinationContext, argv: list[str]) -> int:
         "Verification passed; pushed.",
         timeout=30,
     )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: pr-needs-owner
+# ---------------------------------------------------------------------------
+
+def cmd_pr_needs_owner(ctx: CoordinationContext, argv: list[str]) -> int:
+    """Hand a repair-claimed PR to the owner: the PR is healthy except for
+    something only the owner can do or decide (a file agents may not edit,
+    a decision outside the PR's scope). Posts the question, adds
+    `needs-owner` (which keeps `list-pr-repair` and `claim-pr-repair` off
+    the PR until the owner removes it) and releases `repair-claimed`."""
+    if len(argv) < 2:
+        die('usage: coordination pr-needs-owner N "question for the owner"')
+    pr_num, question = argv[0], argv[1]
+    client = gh.get_client()
+    body = (f"**Needs an owner decision** (repair session "
+            f"`{ctx.session_id}`)\n\n"
+            f"{question}\n\n"
+            "Act on it and remove the `needs-owner` label; repair sessions "
+            "skip this PR until then.")
+    client.gh_cli("issue", "comment", pr_num, "--repo", ctx.repo,
+                  "--body", body, timeout=30)
+    client.gh_cli("pr", "edit", pr_num, "--repo", ctx.repo,
+                  "--add-label", "needs-owner", timeout=15)
+    client.gh_cli("pr", "edit", pr_num, "--repo", ctx.repo,
+                  "--remove-label", "repair-claimed", timeout=15)
+    print(f"PR #{pr_num} handed to the owner (needs-owner); "
+          "repair claim released")
     return 0
 
 
@@ -2166,6 +2207,7 @@ _COMMANDS = {
     "list-replan": cmd_list_replan,
     "claim-pr-repair": cmd_claim_pr_repair,
     "mark-pr-salvaged": cmd_mark_pr_salvaged,
+    "pr-needs-owner": cmd_pr_needs_owner,
     "close-pr-unsalvageable": cmd_close_pr_unsalvageable,
     "list-unclaimed": cmd_list_unclaimed,
     "queue-depth": cmd_queue_depth,
@@ -2196,7 +2238,7 @@ _USAGE = (
     "Usage: coordination "
     "{orient|plan [--label L] [--critical-path]|create-pr|claim-fix|"
     "close-pr|list-pr-repair|list-replan|claim-pr-repair|mark-pr-salvaged|"
-    "close-pr-unsalvageable|list-unclaimed [--label L]|queue-depth [L]|"
+    "pr-needs-owner|close-pr-unsalvageable|list-unclaimed [--label L]|queue-depth [L]|"
     "critical-path-depth|claim|skip|needs-owner|add-dep|check-blocked|check-has-pr|"
     "release-stale-claims|release-orphan-claims|lock-planner|unlock-planner|lock-status|"
     "force-unlock-planner|return-to-human|check-return-to-human|"

@@ -13,12 +13,21 @@ is not worth doing.
 
 ## Core Principle: Fix or Abandon
 
-Repair sessions have exactly two terminal outcomes:
+Repair sessions have exactly three terminal outcomes:
 
 1. **Salvaged** — you pushed a green PR and called `coordination mark-pr-salvaged`.
 2. **Abandoned** — you called `coordination close-pr-unsalvageable` after a
    bounded number of failed attempts. This removes `has-pr` from the linked
    issue and adds `replan`, so a fresh plan can be produced.
+3. **Needs owner** — the PR is fine except for something only the owner
+   can do: a file agents may not edit (such as a spec hash), or a
+   decision outside the PR's scope. Call
+   `coordination pr-needs-owner N "<what the owner must do, and why>"`.
+   It posts the request on the PR, adds `needs-owner` (repair sessions
+   skip the PR until the owner removes it) and releases `repair-claimed`.
+   Use it only when no change you are allowed to make can fix the PR;
+   never end a session that found nothing to fix by only releasing the
+   claim, or the next dispatch picks the same PR again.
 
 **Repair sessions do not author `directive` issues.** The `directive`
 label flows top-down from the project owner; it is not a place agents
@@ -29,9 +38,10 @@ not human tickets. If verification keeps failing, abandon.
 
 | Command | Purpose |
 |---|---|
-| `coordination list-pr-repair` | Read-only list of PRs needing repair, priority-ordered (`conflict` > `failed` > `stuck`). No label writes. |
+| `coordination list-pr-repair` | Read-only list of PRs needing repair, priority-ordered (`conflict` > `failed` > `stuck`). Skips `repair-claimed` and `needs-owner` PRs. No label writes. |
 | `coordination claim-pr-repair N` | Adds `repair-claimed` label + comment, races detected via a short re-read. Fails if already claimed or another session won the race. |
 | `coordination mark-pr-salvaged N` | Clears `repair-claimed`, comments salvage summary. Call after a successful push. |
+| `coordination pr-needs-owner N "question"` | Comments the request on the PR, adds `needs-owner`, clears `repair-claimed`. For a PR only the owner can unblock. |
 | `coordination close-pr-unsalvageable N "reason"` | Closes PR, adds `unsalvageable`, removes `has-pr` on linked issue, adds `replan`. |
 
 PR repair claims live in a namespace distinct from issue claims. Pod's
@@ -107,6 +117,12 @@ coordination mark-pr-salvaged <pr-number>
 Auto-merge (already set by `coordination create-pr`) will squash-merge the
 PR once the remote CI reports green. Exit the session.
 
+**If only the owner can unblock the PR** (the failing check needs a change
+agents may not make, or a decision outside the PR's scope):
+```
+coordination pr-needs-owner <pr-number> "<what the owner must do, and why>"
+```
+
 **If verification fails after at most 3 fix → verify cycles:**
 ```
 coordination close-pr-unsalvageable <pr-number> "<reason>"
@@ -130,6 +146,8 @@ either marked salvaged or closed unsalvageable.
 - `repair-claimed` — set by `claim-pr-repair`, cleared by `mark-pr-salvaged`
   / `close-pr-unsalvageable`, or by the housekeeping reconciler if the
   claiming session dies.
+- `needs-owner` — set by `pr-needs-owner` (or by a feature session); the
+  PR waits for the owner, and `list-pr-repair` / `claim-pr-repair` skip it.
 - `unsalvageable` — set by `close-pr-unsalvageable` on the PR for
   observability. Not functional.
 

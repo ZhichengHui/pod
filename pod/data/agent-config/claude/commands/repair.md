@@ -25,9 +25,9 @@ If the claim output says the PR is already `repair-claimed` or you lost
 the race, skip it and try the next one. If every candidate is claimed,
 exit — a fresh dispatch will handle the work later.
 
-## Two Outcomes, No Escalation
+## Three Outcomes, No Invented Escalation
 
-Repair has exactly two terminal states:
+Repair has exactly three terminal states:
 
 1. **Salvaged** — you got the PR green and pushed:
    ```
@@ -40,6 +40,14 @@ Repair has exactly two terminal states:
    ```
    This closes the PR, removes `has-pr` from the linked issue, and adds
    `replan` so the planner will produce a fresh approach.
+3. **Needs owner** — nothing you are allowed to change can fix the PR (for
+   example the only failing check needs a file agents may not edit):
+   ```
+   coordination pr-needs-owner <pr-number> "<what the owner must do, and why>"
+   ```
+   This adds `needs-owner`, so repair sessions skip the PR until the owner
+   acts. Never end by only releasing the claim: the next dispatch would
+   pick the same PR again.
 
 **Do not escalate by inventing a `directive`.** The `directive` label
 flows top-down from the project owner; agents do not author directives.
